@@ -3,6 +3,10 @@ name = "stringio"
 version = "0.1.0"
 authors = ["Nathan West <Lucretiel@gmail.com>"]
 edition = "2018"
+readme = "README.md"
+license = "MPL-2.0"
+description = "Adapter structs for writing str content to an io::Write"
+repository = "https://github.com/Lucretiel/stringio"
 
 [dependencies]
 arrayvec = "0.4.10"
