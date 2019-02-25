@@ -1,9 +1,11 @@
+#![warn(bare_trait_objects)]
+#![deny(missing_debug_implementations)]
+#![warn(missing_docs)]
 /*
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-
 use std::fmt;
 use std::io;
 
@@ -49,44 +51,55 @@ pub trait StrWrite {
     /// contents reach their destination.
     fn flush(&mut self) -> io::Result<()>;
 
-    /// Attempt to write a while Continuously write buf to the stream until either
-    /// the whole thing is written or an error occurs.
-    ///
-    /// An implementation of this function is provided by default, but in general
-    /// implementors should wrap the underlying write_all method.
+    /// Continuously write buf to the stream until either the whole thing is
+    /// written or an error occurs. An implementation of this function is
+    /// provided by default, which calls write in a loop, but in general
+    /// implementors should wrap the underlying write_all method, if available.
     fn write_all(&mut self, mut buf: &str) -> io::Result<()> {
         while !buf.is_empty() {
             match self.write(buf) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => buf = &buf[n..],
-                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {},
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(err),
             }
         }
         Ok(())
     }
 
+    /// Write some format arguments to the stream. This makes StrWrite compatible
+    /// with write!, println!, etc.
     fn write_fmt(&mut self, args: fmt::Arguments) -> io::Result<()>;
 
+    /// Get a mutable reference to this writer
     fn by_ref(&mut self) -> &mut Self {
         self
     }
 }
 
-pub trait IntoStrWrite: io::Write + Sized {
-    fn as_str_write(self) -> StrWriter<Self> {
+pub trait IntoStrWrite: io::Write {
+    fn into_str_write(self) -> StrWriter<Self>
+    where
+        Self: Sized,
+    {
+        StrWriter::wrap(self)
+    }
+
+    fn str_writer_by_ref(&mut self) -> StrWriter<&mut Self> {
         StrWriter::wrap(self)
     }
 }
 
+impl<W: io::Write> IntoStrWrite for W {}
+
 /// This struct adapts an io::Write into a StrWrite
-#[derive(Debug, Clone)]
-pub struct StrWriter<W> {
+#[derive(Debug, Clone, Default)]
+pub struct StrWriter<W: io::Write> {
     writer: W,
     code_point_buffer: ArrayVec<[u8; 3]>,
 }
 
-impl<W> StrWriter<W> {
+impl<W: io::Write> StrWriter<W> {
     pub fn wrap(writer: W) -> Self {
         StrWriter {
             writer,
@@ -125,10 +138,11 @@ impl<W: io::Write> StrWrite for StrWriter<W> {
         let buf_bytes = buf.as_bytes();
         let mut written = self.writer.write(buf_bytes)?;
 
-        self.code_point_buffer.extend(buf_bytes[written..]
-            .into_iter()
-            .cloned()
-            .filter(move |&b| is_continuation_byte(b))
+        self.code_point_buffer.extend(
+            buf_bytes[written..]
+                .into_iter()
+                .cloned()
+                .filter(move |&b| is_continuation_byte(b)),
         );
         written += self.code_point_buffer.len();
 
@@ -155,7 +169,36 @@ impl<W: io::Write> StrWrite for StrWriter<W> {
     }
 }
 
+impl<W: io::Write> Drop for StrWriter<W> {
+    fn drop(&mut self) {
+        let _result = self.flush_buffer();
+
+        // Don't call self.flush, since we rely on the underlying writer to
+        // flush itself on drop.
+    }
+}
+
+// StrWriter is automatically implemented for all fmt::Write types
+impl<'a, T: fmt::Write> StrWrite for T {
+    fn write(&mut self, buf: &str) -> io::Result<usize> {
+        match self.write_str(buf) {
+            Err(err) => Err(io::Error::new(io::ErrorKind::Other, err)),
+            Ok(()) => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments) -> io::Result<()> {
+        fmt::Write::write_fmt(self, args)
+            .map_err(move |err| io::Error::new(io::ErrorKind::Other, err))
+    }
+}
+
 /// This struct adapts a StrWrite into an io::Write
+#[derive(Debug, Clone, Default)]
 pub struct IoStrWriter<W> {
     writer: W,
     unwritten_byte_buffer: ArrayVec<[u8; 4]>,
@@ -181,7 +224,7 @@ impl<W: StrWrite> io::Write for IoStrWriter<W> {
                     debug_assert!(valid_utf8.is_char_boundary(written));
                     Ok(written)
                 }
-            }
+            },
             Some(b) => {
                 // If there is content in the unwritten_byte_buffer, try to fill out a single
                 // complete code point and write that
@@ -196,7 +239,8 @@ impl<W: StrWrite> io::Write for IoStrWriter<W> {
                     ),
                 };
 
-                self.unwritten_byte_buffer.extend(buf.iter().cloned().take(target_length - current_length));
+                self.unwritten_byte_buffer
+                    .extend(buf.iter().cloned().take(target_length - current_length));
 
                 match partial_from_utf8(&self.unwritten_byte_buffer) {
                     // In this case, the new bytes were invalid. Truncate them and return the error.
@@ -269,13 +313,14 @@ impl<W: StrWrite> io::Write for IoStrWriter<W> {
             // We'll reuse this number later, to re-slice the user's buffer and
             // try to write it with write_all.
             let num_extra_bytes = target_length - current_length;
-            self.unwritten_byte_buffer.extend(buf.iter().cloned().take(num_extra_bytes));
+            self.unwritten_byte_buffer
+                .extend(buf.iter().cloned().take(num_extra_bytes));
 
             match partial_from_utf8(&self.unwritten_byte_buffer) {
                 // In this case, the new bytes were invalid. Truncate them and return the error.
                 Err(err) => {
                     self.unwritten_byte_buffer.truncate(current_length);
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, err))
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, err));
                 }
 
                 // We got some new data, but not enough for a whole code point.
@@ -284,7 +329,10 @@ impl<W: StrWrite> io::Write for IoStrWriter<W> {
                 // We got a whole code point! Write it, then continue writing
                 Ok((str_part, &[])) => self.writer.write_all(str_part)?,
 
-                Ok(_) => unreachable!("Invalid data was present in unwritten_byte_buffer: ${:#X?}", self.unwritten_byte_buffer),
+                Ok(_) => unreachable!(
+                    "Invalid data was present in unwritten_byte_buffer: ${:#X?}",
+                    self.unwritten_byte_buffer
+                ),
             }
 
             self.unwritten_byte_buffer.clear();
