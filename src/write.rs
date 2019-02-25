@@ -75,18 +75,29 @@ pub trait StrWrite {
     fn by_ref(&mut self) -> &mut Self {
         self
     }
+
+    /// Convert this StrWrite into a type which implements io::Write.
+    fn into_io_writer(self) -> IoStrWriter<Self>
+    where
+        Self: Sized,
+    {
+        IoStrWriter::new(self)
+    }
 }
 
+/// Helper trait to convert io::Write instances into StrWrite instances.
 pub trait IntoStrWrite: io::Write {
+    /// Wrap an io::Write in a StrWriter by value
     fn into_str_write(self) -> StrWriter<Self>
     where
         Self: Sized,
     {
-        StrWriter::wrap(self)
+        StrWriter::new(self)
     }
 
+    /// Wrap an io::Write in a StrWriter by reference
     fn str_writer_by_ref(&mut self) -> StrWriter<&mut Self> {
-        StrWriter::wrap(self)
+        StrWriter::new(self)
     }
 }
 
@@ -100,11 +111,18 @@ pub struct StrWriter<W: io::Write> {
 }
 
 impl<W: io::Write> StrWriter<W> {
-    pub fn wrap(writer: W) -> Self {
+    /// Construct a new StrWriter with an io::Write
+    pub fn new(writer: W) -> Self {
         StrWriter {
             writer,
             code_point_buffer: ArrayVec::new(),
         }
+    }
+}
+
+impl<W: io::Write> From<W> for StrWriter<W> {
+    fn from(writer: W) -> Self {
+        StrWriter::new(writer)
     }
 }
 
@@ -140,7 +158,7 @@ impl<W: io::Write> StrWrite for StrWriter<W> {
 
         self.code_point_buffer.extend(
             buf_bytes[written..]
-                .into_iter()
+                .iter()
                 .cloned()
                 .filter(move |&b| is_continuation_byte(b)),
         );
@@ -155,7 +173,8 @@ impl<W: io::Write> StrWrite for StrWriter<W> {
     }
 
     fn write_all(&mut self, buf: &str) -> io::Result<()> {
-        // Because write_all doesn't specify how much of the output was written, we're
+        // Because write_all doesn't specify how much of the output was written, or
+        // what the state of the writer is after it returns with an error, we're
         // under no obligation to specify that only a fixed number of code points were
         // written, so we can use the underlyting write_all directly.
         self.flush_buffer()?;
@@ -178,11 +197,58 @@ impl<W: io::Write> Drop for StrWriter<W> {
     }
 }
 
-/// This struct adapts a StrWrite into an io::Write
+impl StrWrite for String {
+    fn write(&mut self, buf: &str) -> io::Result<usize> {
+        self.push_str(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_all(&mut self, buf: &str) -> io::Result<()> {
+        self.push_str(buf);
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments) -> io::Result<()> {
+        fmt::Write::write_fmt(self, args)
+            .map_err(move |err| io::Error::new(io::ErrorKind::Other, err))
+    }
+}
+
+/// This struct adapts a StrWrite into an io::Write. This struct works by converting
+/// incoming UTF-8 bytes into `&str`s and passing them to the underlying writer.
+/// If a write ends with a partial code point, those bytes are buffered, and when
+/// when a subsequent write provides the suffix of the code point, it is written.
 #[derive(Debug, Clone, Default)]
-pub struct IoStrWriter<W> {
+pub struct IoStrWriter<W: StrWrite> {
     writer: W,
     unwritten_byte_buffer: ArrayVec<[u8; 4]>,
+}
+
+impl<W: StrWrite> IoStrWriter<W> {
+    /// Create a new IoStrWriter from a StrWrite type
+    pub fn new(writer: W) -> Self {
+        IoStrWriter {
+            writer,
+            unwritten_byte_buffer: ArrayVec::new(),
+        }
+    }
+
+    /// Check if there is an unwritten partial code point from a prior write.
+    /// These bytes will be silently dropped if the IoStrWriter is dropped,
+    /// because there's no way to convert them into a str to pass to writer.
+    pub fn has_unwritten_bytes(&self) -> bool {
+        !self.unwritten_byte_buffer.is_empty()
+    }
+}
+
+impl<W: StrWrite> From<W> for IoStrWriter<W> {
+    fn from(writer: W) -> Self {
+        Self::new(writer)
+    }
 }
 
 impl<W: StrWrite> io::Write for IoStrWriter<W> {
@@ -190,7 +256,7 @@ impl<W: StrWrite> io::Write for IoStrWriter<W> {
         match self.unwritten_byte_buffer.first().cloned() {
             // If the unwritten_byte_buffer is empty, then buf should start with a valid
             // UTF-8 string that may have been cut off. We attempt to write the part
-            // which can be converted into a str, then store the trailing bytes.
+            // which can be converted into a str, or store the trailing bytes.
             None => match partial_from_utf8(buf) {
                 Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err)),
                 Ok(("", suffix)) => {
@@ -318,6 +384,7 @@ impl<W: StrWrite> io::Write for IoStrWriter<W> {
 
             self.unwritten_byte_buffer.clear();
 
+            // If there are more bytes to be written, update buf and continue below
             buf = match buf.get(num_extra_bytes..) {
                 None | Some(&[]) => return Ok(()),
                 Some(tail) => tail,

@@ -1,15 +1,16 @@
-/*use std::io;
+use std::io;
 
+use crate::partial_from_utf8_mut;
 use arrayvec::ArrayVec;
-use crate::{partial_from_utf8_mut};
 
 /// This trait is similar to io::Read, but it operates on UTF-8 strings.
 pub trait StrRead {
-    // Read bytes into a user-provided buffer, and return the prefix of that buffer
-    // that contains a valid UTF-8 string.
-    // Note that this function may return Ok("") for any of the reasons of io::Read::read,
-    // and may additionally do so if the buffer is too small to fit the next code point.
-    fn read<'a>(&mut self, buf: &'a mut [u8]) -> io::Result<(&'a mut str, &'a mut [u8])>;
+    /// Read a str into a user-provided str, and modify the size of the str to fit
+    //
+    /// Note that this function may return Ok("") for any of the reasons that io::Read::read
+    /// might return Ok(0) and may additionally do so if the buffer is too small to fit the
+    /// next code point.
+    fn read<'a>(&mut self, buf: &'a mut [u8]) -> io::Result<&'a mut str>;
 }
 
 pub trait StrBufRead: StrRead {
@@ -27,60 +28,44 @@ pub struct StrReader<R: io::Read> {
 }
 
 impl<R: io::Read> StrRead for StrReader<R> {
-    fn read_into<'a>(&mut self, buf: &'a mut [u8]) -> io::Result<&'a mut str> {
-        if buf.len() <= self.code_point_buffer.len() {
-            // Hmm. The user didn't give us enough room to do a read from the
-            // underlying reader. Just try to give them some bytes from the
-            // code_point_buffer.
-            buf.copy_from_slice(&self.code_point_buffer[..buf.len()]);
-            match partial_from_utf8_mut(buf) {
-                // The data in code_point_buffer was insufficent. Just return
-                // an empty string.
-                Ok(("", suffix)) => Ok(""),
-
-                // We have something for them! Drain the str_part bytes from
-                // code_point_buffer, then return the str.
-                Ok((str_part, suffix)) => {
-                    self.code_point_buffer.drain(..str_part.len());
-                    Ok(str_part);
-                }
-
-                Err(err) => unreachable!("Invalid UTF8 bytes were somehow added to code_point_buffer: {:#X?}", self.code_point_buffer)
+    fn read<'a>(&mut self, buf: &'a mut [u8]) -> io::Result<&'a mut str> {
+        // Count is the total number of bytes that we copied + read into buf
+        let count = if !self.code_point_buffer.is_empty() {
+            // We have some data in code_point_buffer from a prior read.
+            if buf.len() <= self.code_point_buffer.len() {
+                // Hmm. We have some data in count_from_buffer, but the user didn't
+                // give us enough room for it. It's an invariant that count_from_buffer
+                // has less than 1 code point in it, so we just have to return nothing.
+                return Ok(<&mut str>::default());
             }
+
+            // Copy code_point_buffer into buf, then do a read from the underlying reader.
+
+            let (lhs, rhs) = buf.split_at_mut(self.code_point_buffer.len());
+
+            let count_from_buffer = self.code_point_buffer.len();
+            lhs.copy_from_slice(&self.code_point_buffer);
+
+            let count_from_reader = self.reader.read(rhs)?;
+
+            self.code_point_buffer.clear();
+
+            count_from_buffer + count_from_reader
         } else {
-            // Count is the total number of bytes that we copied + read into buf
-            let count = if !self.code_point_buffer.is_empty() {
-                // We have some data in code_point_buffer from a prior read. Copy those
-                // bytes into buf, then do a read from the underlying reader.
+            // No code_point_buffer, so just read directly into buf
+            self.reader.read(buf)?
+        };
 
-                let (lhs, rhs) = buf.split_at_mut(self.code_point_buffer.len());
-
-                let count_from_buffer = self.code_point_buffer.len();
-                lhs.copy_from_slice(&self.code_point_buffer);
-
-                let count_from_reader = self.reader.read(rhs)?;
-
-                self.code_point_buffer.clear();
-
-                count_from_buffer + count_from_reader
-            } else {
-                //
-                self.reader.read(buf)?
-            };
-
-            match partial_from_utf8_mut(&mut buf[..count]) {
-                Ok((str_part, suffix)) => {
-                    self.code_point_buffer.extend(suffix.iter().cloned());
-                    Ok(str_part)
-                },
-                Err(err) => {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, err))
-                }
+        match partial_from_utf8_mut(&mut buf[..count]) {
+            Ok((str_part, suffix)) => {
+                self.code_point_buffer.extend(suffix.iter().cloned());
+                Ok(str_part)
             }
+            Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err)),
         }
     }
 }
-*/
+
 /*
 trait Length {
     fn len(&self) -> usize;
