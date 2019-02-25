@@ -178,25 +178,6 @@ impl<W: io::Write> Drop for StrWriter<W> {
     }
 }
 
-// StrWriter is automatically implemented for all fmt::Write types
-impl<'a, T: fmt::Write> StrWrite for T {
-    fn write(&mut self, buf: &str) -> io::Result<usize> {
-        match self.write_str(buf) {
-            Err(err) => Err(io::Error::new(io::ErrorKind::Other, err)),
-            Ok(()) => Ok(buf.len()),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn write_fmt(&mut self, args: fmt::Arguments) -> io::Result<()> {
-        fmt::Write::write_fmt(self, args)
-            .map_err(move |err| io::Error::new(io::ErrorKind::Other, err))
-    }
-}
-
 /// This struct adapts a StrWrite into an io::Write
 #[derive(Debug, Clone, Default)]
 pub struct IoStrWriter<W> {
